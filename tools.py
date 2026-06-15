@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,20 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+# Groq model used for the LLM-backed tools. llama-3.3-70b is fast and capable
+# enough for short styling/caption generation.
+_MODEL = "llama-3.3-70b-versatile"
+
+# Words that carry no matching signal — stripped before keyword scoring so that
+# filler like "a vintage tee under" only scores on "vintage" and "tee".
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "in", "on", "of", "to",
+    "i", "im", "i'm", "am", "looking", "want", "need", "find", "some",
+    "under", "below", "less", "than", "max", "size", "sized", "price",
+    "cheap", "around", "about", "my", "me", "something", "anything",
+    "that", "this", "is", "are", "be", "can", "you", "please", "would",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -32,6 +47,24 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _llm(messages: list[dict], temperature: float = 0.7, max_tokens: int = 400) -> str:
+    """Run a chat completion against Groq and return the response text."""
+    client = _get_groq_client()
+    resp = client.chat.completions.create(
+        model=_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase, split on non-alphanumerics, and drop stopwords."""
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +102,42 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    keywords = _tokenize(description)
+
+    scored = []
+    for item in listings:
+        # 1. Price filter (inclusive).
+        if max_price is not None and item["price"] > max_price:
+            continue
+
+        # 2. Size filter — flexible, case-insensitive. The requested size matches
+        #    if it appears as a token within the listing's size string, so "M"
+        #    matches "M" and "S/M", and "8" matches "8" or "W8 L30".
+        if size:
+            size_tokens = re.findall(r"[a-z0-9]+", item["size"].lower())
+            if size.strip().lower() not in size_tokens:
+                continue
+
+        # 3. Score by keyword overlap against title, description, and style_tags.
+        haystack = " ".join([
+            item["title"],
+            item["description"],
+            " ".join(item["style_tags"]),
+            item["category"],
+        ]).lower()
+        score = sum(1 for kw in keywords if kw in haystack)
+
+        # 4. Drop listings with no relevant match. If the user gave no usable
+        #    keywords at all, keep everything that passed the size/price filters.
+        if keywords and score == 0:
+            continue
+
+        scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable — preserves dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +167,63 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = (
+        f"{new_item['title']} (category: {new_item['category']}, "
+        f"style: {', '.join(new_item['style_tags'])}, "
+        f"colors: {', '.join(new_item['colors'])})"
+    )
+
+    items = wardrobe.get("items", []) if wardrobe else []
+
+    if not items:
+        # Empty wardrobe — give general styling advice for the piece on its own.
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a sharp, friendly personal stylist. Keep advice "
+                    "concrete and concise — 2 to 4 sentences, no bullet points."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"I'm thinking about buying this secondhand piece: {item_desc}. "
+                    "I haven't told you what's in my closet. Suggest what kinds of "
+                    "pieces (categories, colors, vibe) would pair well with it and "
+                    "what occasions it suits."
+                ),
+            },
+        ]
+        return _llm(messages, temperature=0.7)
+
+    # Non-empty wardrobe — suggest specific combinations using named pieces.
+    wardrobe_lines = "\n".join(
+        f"- {it['name']} ({it['category']}; "
+        f"{', '.join(it.get('style_tags', []))})"
+        for it in items
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a sharp, friendly personal stylist. You build outfits "
+                "ONLY from the new item plus pieces the user actually owns — never "
+                "invent items they don't have. Suggest 1 or 2 complete outfits, "
+                "naming the specific wardrobe pieces you'd pair with the new item "
+                "and briefly why it works. Keep it to a short paragraph or two."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"New piece I'm considering: {item_desc}.\n\n"
+                f"Here's what's in my closet:\n{wardrobe_lines}\n\n"
+                "How would you style the new piece with what I own?"
+            ),
+        },
+    ]
+    return _llm(messages, temperature=0.7)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +255,37 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty or whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "I don't have enough outfit details to generate a fit card — "
+            "let me re-run the outfit suggestion first."
+        )
+
+    # 2. Build a prompt with the item details and the styled outfit.
+    item_line = (
+        f"{new_item['title']} — ${new_item['price']:.2f} on {new_item['platform']}"
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write short, authentic Instagram/TikTok outfit captions — the "
+                "way a real person posts an OOTD, not a product listing. 2 to 4 "
+                "sentences. Mention the item name, its price, and the platform "
+                "naturally, once each. Capture the specific vibe of the outfit. End "
+                "with 4 to 6 relevant style hashtags on their own line. Be casual "
+                "and a little playful; no corporate copy."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Thrifted find: {item_line}.\n\n"
+                f"How it's being styled:\n{outfit}\n\n"
+                "Write the caption."
+            ),
+        },
+    ]
+    # 3. Higher temperature so different outfits read differently.
+    return _llm(messages, temperature=0.9)
